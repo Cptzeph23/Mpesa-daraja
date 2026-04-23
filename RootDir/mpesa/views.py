@@ -2,6 +2,7 @@ import json
 import logging
 
 from django.http import JsonResponse
+from django.shortcuts import render
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
@@ -13,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_phone(phone: str) -> str:
-    """Normalize phone to 2547XXXXXXXX format."""
     phone = phone.strip().replace(" ", "").replace("-", "")
     if phone.startswith("+"):
         phone = phone[1:]
@@ -22,9 +22,11 @@ def normalize_phone(phone: str) -> str:
     return phone
 
 
-class STKPushView(View):
-    """Initiate STK push and persist the pending transaction."""
+def payment_page(request):
+    return render(request, "mpesa/payment.html")
 
+
+class STKPushView(View):
     def post(self, request, *args, **kwargs):
         try:
             body = json.loads(request.body)
@@ -46,23 +48,19 @@ class STKPushView(View):
             if amount < 1:
                 raise ValueError
         except (ValueError, TypeError):
-            return JsonResponse({"error": "amount must be a positive integer"}, status=400)
+            return JsonResponse(
+                {"error": "amount must be a positive integer"}, status=400
+            )
 
         phone = normalize_phone(phone)
-
         response = initiate_stk_push(phone, amount, reference, description)
 
         if "error" in response:
             return JsonResponse({"error": response["error"]}, status=502)
 
-        # ResponseCode "0" means request accepted
         if response.get("ResponseCode") != "0":
             return JsonResponse(
-                {
-                    "error": response.get(
-                        "errorMessage", "STK push rejected by Safaricom"
-                    )
-                },
+                {"error": response.get("errorMessage", "STK push rejected by Safaricom")},
                 status=400,
             )
 
@@ -87,8 +85,6 @@ class STKPushView(View):
 
 @method_decorator(csrf_exempt, name="dispatch")
 class MpesaCallbackView(View):
-    """Receive and process Safaricom's payment result callback."""
-
     def post(self, request, *args, **kwargs):
         try:
             body = json.loads(request.body)
@@ -106,26 +102,20 @@ class MpesaCallbackView(View):
                 checkout_request_id=checkout_request_id
             )
 
-            if result_code == "0":
-                transaction.status = MpesaTransaction.Status.SUCCESS
-            else:
-                transaction.status = MpesaTransaction.Status.FAILED
-
+            transaction.status = (
+                MpesaTransaction.Status.SUCCESS
+                if result_code == "0"
+                else MpesaTransaction.Status.FAILED
+            )
             transaction.result_code = result_code
             transaction.result_description = result_desc
-            transaction.save(update_fields=["status", "result_code", "result_description", "updated_at"])
-
-            logger.info(
-                "M-Pesa callback processed: %s | Code: %s | %s",
-                checkout_request_id, result_code, result_desc,
+            transaction.save(
+                update_fields=["status", "result_code", "result_description", "updated_at"]
             )
 
         except MpesaTransaction.DoesNotExist:
-            logger.warning("Callback for unknown CheckoutRequestID: %s", checkout_request_id)
-        except (KeyError, Exception) as e:
+            logger.warning("Callback for unknown CheckoutRequestID")
+        except Exception as e:
             logger.error("Error processing M-Pesa callback: %s", e)
 
-        # Always return success to Safaricom — prevents retries
         return JsonResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
-    
-    
